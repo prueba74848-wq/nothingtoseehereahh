@@ -1,15 +1,14 @@
 {
-    "name": "StickerIDFinder",
-    "description": "Copies the IDs of the Wave, Sup and Scream stickers in six default Discord packs to your clipboard.",
-    "authors": [
-        {
-            "name": "you",
-            "id": "0"
-        }
-    ],
-    "main": "index.js",
-    "vendetta": {
-        "icon": "ic_search"
-    },
-    "hash": "438c2fcb58483228492053020c962c74fb27f82454917168cf746bc7f8d2b250"
+  "name": "Auto Read Pings",
+  "description": "Automatically marks a channel as read when you get pinged by @everyone, @here, or roles you choose.",
+  "authors": [
+    {
+      "name": "prueba74848-wq"
+    }
+  ],
+  "main": "index.js",
+  "hash": "d486b6b96065ebfb67c0ecebe539f6557096811e803ccae82585e08627cb1b9f",
+  "vendetta": {
+    "icon": "ic_eye"
+  }
 }

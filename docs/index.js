@@ -228,6 +228,7 @@ function Settings() {
   var _c = React.useState(""), roleInput = _c[0], setRoleInput = _c[1];
   var _d = React.useState([]), guildRoles = _d[0], setGuildRoles = _d[1];
   var _e = React.useState(String(s.delay)), delayInput = _e[0], setDelayInput = _e[1];
+  var _f = React.useState(""), diag = _f[0], setDiag = _f[1];
 
   var toast = function (t, icon) { toasts.showToast(t, assets.getAssetIDByName(icon || "ic_check")); };
 
@@ -245,12 +246,23 @@ function Settings() {
       if (!GuildStore.getGuild(gid)) { toast("Server not found", "ic_close_16px"); return; }
       var all = rolesOf(gid);
       var mine = myRoleIds(gid);
+      var allList = Object.keys(all)
+        .filter(function (id) { return id !== gid; }) // drop @everyone role
+        .map(function (id) { return { id: id, name: all[id].name || ("Role " + id), pos: all[id].position || 0 }; })
+        .sort(function (a, b) { return b.pos - a.pos; });
       var list = mine
-        .map(function (id) { return all[id]; })
-        .filter(function (r) { return r && r.id !== gid; }) // drop @everyone role
-        .map(function (r) { return { id: r.id, name: r.name }; });
+        .filter(function (id) { return id !== gid; })
+        .map(function (id) { return { id: id, name: (all[id] && all[id].name) || ("Role " + id) }; });
+      var note = "Known roles: " + allList.length + ", yours detected: " + list.length + ".";
+      if (!list.length && allList.length) {
+        list = allList;
+        note += " Couldn't detect which roles you have, so showing every role in this server.";
+        toast("Showing all server roles", "ic_check");
+      } else if (!list.length) {
+        toast("No roles found for that server", "ic_close_16px");
+      }
+      setDiag(note);
       setGuildRoles(list);
-      if (!list.length) toast("You have no roles there", "ic_close_16px");
     } catch (e) {
       console.log(TAG, "load roles failed", e);
       toast("Couldn't load roles", "ic_close_16px");
@@ -327,6 +339,7 @@ function Settings() {
     }),
     h(Forms.FormRow, { key: "load", label: "Load my roles", onPress: loadGuildRoles })
   ];
+  if (diag) pickerChildren.push(h(Forms.FormText, { key: "diag", style: { padding: 12 } }, diag));
   guildRoles.forEach(function (r) {
     pickerChildren.push(h(Forms.FormSwitchRow, {
       key: "gr" + r.id, label: r.name, subLabel: r.id,

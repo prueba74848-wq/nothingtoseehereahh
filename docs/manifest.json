@@ -1,14 +1,15 @@
 {
-  "name": "Auto Read Pings",
-  "description": "Automatically marks a channel as read when you get pinged by @everyone, @here, or roles you choose.",
-  "authors": [
-    {
-      "name": "prueba74848-wq"
-    }
-  ],
-  "main": "index.js",
-  "hash": "d486b6b96065ebfb67c0ecebe539f6557096811e803ccae82585e08627cb1b9f",
-  "vendetta": {
-    "icon": "ic_eye"
-  }
+    "name": "Auto Read Pings",
+    "description": "Automatically marks the channel as read when you get pinged by @everyone, @here or roles you choose",
+    "authors": [
+        {
+            "name": "you",
+            "id": "0"
+        }
+    ],
+    "main": "index.js",
+    "vendetta": {
+        "icon": "ic_eye"
+    },
+    "hash": "d486b6b96065ebfb67c0ecebe539f6557096811e803ccae82585e08627cb1b9f"
 }

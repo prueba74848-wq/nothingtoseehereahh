@@ -32,7 +32,9 @@ var DEFAULTS = {
   here: true,
   direct: false,
   roles: [],
-  delay: 500
+  delay: 500,
+  scanOnLoad: true,
+  clearUnknown: true
 };
 
 function S() {
@@ -51,12 +53,35 @@ function myId() {
   try { return store("UserStore")?.getCurrentUser?.()?.id; } catch (e) { return null; }
 }
 
+function rolesOf(gid) {
+  try {
+    var r = store("GuildRoleStore")?.getRoles?.(gid);
+    if (r && Object.keys(r).length) return r;
+  } catch (e) {}
+  try {
+    var r2 = store("GuildStore")?.getRoles?.(gid);
+    if (r2 && Object.keys(r2).length) return r2;
+  } catch (e) {}
+  try {
+    return store("GuildStore")?.getGuild?.(gid)?.roles || {};
+  } catch (e) {}
+  return {};
+}
+
+function myRoleIds(gid) {
+  var me = myId();
+  var GMS = store("GuildMemberStore");
+  var member = null;
+  try { member = GMS?.getSelfMember?.(gid); } catch (e) {}
+  if (!member) { try { member = GMS?.getMember?.(gid, me); } catch (e) {} }
+  return (member && member.roles) || [];
+}
+
 function roleName(roleId) {
   try {
-    var GuildStore = store("GuildStore");
-    var guilds = GuildStore.getGuilds();
+    var guilds = store("GuildStore").getGuilds();
     for (var gid in guilds) {
-      var roles = GuildStore.getRoles(gid);
+      var roles = rolesOf(gid);
       if (roles && roles[roleId]) return roles[roleId].name + " (" + guilds[gid].name + ")";
     }
   } catch (e) {}
@@ -64,11 +89,14 @@ function roleName(roleId) {
 }
 
 // ---------- ping detection ----------
+// Handles both raw gateway messages (snake_case) and cached Message objects (camelCase)
 function isWatchedPing(msg, me) {
   var s = S();
   var content = msg.content || "";
+  var mentionEveryone = msg.mention_everyone !== undefined ? msg.mention_everyone : msg.mentionEveryone;
+  var mentionRoles = msg.mention_roles || msg.mentionRoles;
 
-  if (msg.mention_everyone) {
+  if (mentionEveryone) {
     var hasEveryone = content.indexOf("@everyone") !== -1;
     var hasHere = content.indexOf("@here") !== -1;
     if (hasEveryone && s.everyone) return true;
@@ -83,12 +111,71 @@ function isWatchedPing(msg, me) {
     }
   }
 
-  if (Array.isArray(msg.mention_roles) && s.roles.length) {
-    for (var j = 0; j < msg.mention_roles.length; j++) {
-      if (s.roles.indexOf(msg.mention_roles[j]) !== -1) return true;
+  if (mentionRoles && s.roles.length) {
+    for (var j = 0; j < mentionRoles.length; j++) {
+      if (s.roles.indexOf(mentionRoles[j]) !== -1) return true;
     }
   }
   return false;
+}
+
+// ---------- scan pings that arrived before the plugin / while it was off ----------
+function mentionChannelIds() {
+  var RS = store("ReadStateStore");
+  if (!RS) return [];
+  try {
+    var ids = RS.getMentionChannelIds && RS.getMentionChannelIds();
+    if (ids) return Array.from(ids);
+  } catch (e) {}
+  var out = [];
+  try {
+    var guilds = store("GuildStore").getGuilds();
+    var CS = store("GuildChannelStore") || store("ChannelStore");
+    for (var gid in guilds) {
+      var data = CS && CS.getChannels && CS.getChannels(gid);
+      var list = [].concat((data && data.SELECTABLE) || [], (data && data.VOCAL) || []);
+      list.forEach(function (c) {
+        var ch = (c && c.channel) || c;
+        if (ch && ch.id && RS.getMentionCount && RS.getMentionCount(ch.id) > 0) out.push(ch.id);
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+function cachedMessages(channelId) {
+  try {
+    var MS = store("MessageStore");
+    var m = MS && MS.getMessages && MS.getMessages(channelId);
+    if (!m) return [];
+    if (m._array) return m._array;
+    if (m.toArray) return m.toArray();
+  } catch (e) {}
+  return [];
+}
+
+function scanExisting() {
+  var me = myId();
+  var s = S();
+  var CS = store("ChannelStore");
+  var count = 0;
+  mentionChannelIds().forEach(function (id) {
+    try {
+      var ch = CS && CS.getChannel && CS.getChannel(id);
+      if (!ch || !ch.guild_id) return; // servers only, never DMs
+      var msgs = cachedMessages(id);
+      var hit;
+      if (msgs.length) {
+        hit = msgs.some(function (m) {
+          return !(m.author && m.author.id === me) && isWatchedPing(m, me);
+        });
+      } else {
+        hit = !!s.clearUnknown;
+      }
+      if (hit) { ackChannel(id, null); count++; }
+    } catch (e) { console.log(TAG, "scan error", e); }
+  });
+  return count;
 }
 
 var pending = {};
@@ -156,10 +243,8 @@ function Settings() {
     try {
       var GuildStore = store("GuildStore");
       if (!GuildStore.getGuild(gid)) { toast("Server not found", "ic_close_16px"); return; }
-      var all = GuildStore.getRoles(gid) || {};
-      var me = myId();
-      var member = store("GuildMemberStore")?.getMember?.(gid, me);
-      var mine = (member && member.roles) || [];
+      var all = rolesOf(gid);
+      var mine = myRoleIds(gid);
       var list = mine
         .map(function (id) { return all[id]; })
         .filter(function (r) { return r && r.id !== gid; }) // drop @everyone role
@@ -167,6 +252,7 @@ function Settings() {
       setGuildRoles(list);
       if (!list.length) toast("You have no roles there", "ic_close_16px");
     } catch (e) {
+      console.log(TAG, "load roles failed", e);
       toast("Couldn't load roles", "ic_close_16px");
     }
   };
@@ -196,6 +282,26 @@ function Settings() {
     h(Forms.FormSwitchRow, {
       label: "Direct @you mentions", value: !!s.direct,
       onValueChange: function (v) { s.direct = v; rerender(); }
+    })
+  ));
+
+  rows.push(h(Forms.FormSection, { key: "existing", title: "Pings from before the plugin" },
+    h(Forms.FormSwitchRow, {
+      label: "Clear existing pings on startup", value: !!s.scanOnLoad,
+      onValueChange: function (v) { s.scanOnLoad = v; rerender(); }
+    }),
+    h(Forms.FormSwitchRow, {
+      label: "Also clear channels I can't inspect",
+      subLabel: "Old pings whose messages aren't loaded can't be checked, so clear them anyway",
+      value: !!s.clearUnknown,
+      onValueChange: function (v) { s.clearUnknown = v; rerender(); }
+    }),
+    h(Forms.FormRow, {
+      label: "Clear existing pings now",
+      onPress: function () {
+        var n = scanExisting();
+        toast(n ? "Cleared " + n + " channel" + (n === 1 ? "" : "s") : "Nothing to clear");
+      }
     })
   ));
 
@@ -252,12 +358,17 @@ function Settings() {
 }
 
 // ---------- lifecycle ----------
+var scanTimer;
 var plug = {
   onLoad: function () {
     S();
     FluxDispatcher.subscribe("MESSAGE_CREATE", onMessage);
+    if (S().scanOnLoad) {
+      scanTimer = setTimeout(function () { try { scanExisting(); } catch (e) {} }, 3000);
+    }
   },
   onUnload: function () {
+    if (scanTimer) clearTimeout(scanTimer);
     FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessage);
     for (var k in pending) clearTimeout(pending[k]);
     pending = {};

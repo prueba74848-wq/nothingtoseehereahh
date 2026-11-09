@@ -34,7 +34,8 @@ var DEFAULTS = {
   roles: [],
   delay: 500,
   scanOnLoad: true,
-  clearUnknown: true
+  clearUnknown: true,
+  debug: true
 };
 
 function S() {
@@ -159,7 +160,8 @@ function scanExisting() {
   var s = S();
   var CS = store("ChannelStore");
   var count = 0;
-  mentionChannelIds().forEach(function (id) {
+  var scanIds = mentionChannelIds();
+  scanIds.forEach(function (id) {
     try {
       var ch = CS && CS.getChannel && CS.getChannel(id);
       if (!ch || !ch.guild_id) return; // servers only, never DMs
@@ -175,19 +177,38 @@ function scanExisting() {
       if (hit) { ackChannel(id, null); count++; }
     } catch (e) { console.log(TAG, "scan error", e); }
   });
+  dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
   return count;
 }
 
 var pending = {};
 
+function dbg(text) {
+  try {
+    if (S().debug) toasts.showToast("ARP: " + text, assets.getAssetIDByName("ic_check"));
+    console.log(TAG, text);
+  } catch (e) {}
+}
+
 function ackChannel(channelId, fallbackMsgId) {
-  var ReadStateStore = store("ReadStateStore");
-  var messageId = (ReadStateStore && ReadStateStore.lastMessageId && ReadStateStore.lastMessageId(channelId)) || fallbackMsgId;
-  FluxDispatcher.dispatch({
-    type: "BULK_ACK",
-    context: "APP",
-    channels: [{ channelId: channelId, messageId: messageId, readStateType: 0 }]
-  });
+  var RS = store("ReadStateStore");
+  var messageId = (RS && RS.lastMessageId && RS.lastMessageId(channelId)) || fallbackMsgId;
+  if (!messageId) {
+    var ch = store("ChannelStore")?.getChannel?.(channelId);
+    messageId = ch && ch.lastMessageId;
+  }
+  if (!messageId) { dbg("no message id to ack"); return; }
+  var entry = [{ channelId: channelId, messageId: messageId, readStateType: 0 }];
+  // The real ack util also tells Discord's servers, so the badge doesn't come back after a restart.
+  var acker = null;
+  try { acker = metro.findByProps("bulkAck", "ack"); } catch (e) {}
+  if (acker && typeof acker.bulkAck === "function") {
+    acker.bulkAck(entry);
+    dbg("acked via bulkAck");
+  } else {
+    FluxDispatcher.dispatch({ type: "BULK_ACK", context: "APP", channels: entry });
+    dbg("acked via dispatch (local only)");
+  }
 }
 
 function onMessage(action) {
@@ -206,7 +227,11 @@ function onMessage(action) {
 
     var me = myId();
     if (msg.author && msg.author.id === me) return;
-    if (!isWatchedPing(msg, me)) return;
+    if (!isWatchedPing(msg, me)) {
+      if (msg.mention_everyone || (msg.mention_roles && msg.mention_roles.length)) dbg("ping seen but not matched");
+      return;
+    }
+    dbg("ping detected, clearing soon");
 
     if (pending[channelId]) clearTimeout(pending[channelId]);
     var delay = Math.max(0, Number(S().delay) || 0);
@@ -356,6 +381,14 @@ function Settings() {
     h(Forms.FormRow, { label: "Add role", onPress: addRoleById })
   ));
 
+  rows.push(h(Forms.FormSection, { key: "debug", title: "Troubleshooting" },
+    h(Forms.FormSwitchRow, {
+      label: "Debug toasts", subLabel: "Shows what the plugin is doing (ping seen, matched, acked)",
+      value: !!s.debug,
+      onValueChange: function (v) { s.debug = v; rerender(); }
+    })
+  ));
+
   rows.push(h(Forms.FormSection, { key: "delay", title: "Delay before marking read (ms)" },
     h(Forms.FormInput, {
       placeholder: "500", value: delayInput, keyboardType: "number-pad",
@@ -371,17 +404,30 @@ function Settings() {
 }
 
 // ---------- lifecycle ----------
-var scanTimer;
+var scanTimers = [];
+function onAppState(action) {
+  try {
+    if (action && action.state === "active" && S().scanOnLoad) {
+      scanTimers.push(setTimeout(function () { try { scanExisting(); } catch (e) {} }, 2000));
+    }
+  } catch (e) {}
+}
 var plug = {
   onLoad: function () {
     S();
     FluxDispatcher.subscribe("MESSAGE_CREATE", onMessage);
+    FluxDispatcher.subscribe("APP_STATE_UPDATE", onAppState);
     if (S().scanOnLoad) {
-      scanTimer = setTimeout(function () { try { scanExisting(); } catch (e) {} }, 3000);
+      // the read state may not be populated right at startup, so retry a few times
+      [3000, 10000, 30000].forEach(function (ms) {
+        scanTimers.push(setTimeout(function () { try { scanExisting(); } catch (e) {} }, ms));
+      });
     }
   },
   onUnload: function () {
-    if (scanTimer) clearTimeout(scanTimer);
+    FluxDispatcher.unsubscribe("APP_STATE_UPDATE", onAppState);
+    scanTimers.forEach(clearTimeout);
+    scanTimers = [];
     FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessage);
     for (var k in pending) clearTimeout(pending[k]);
     pending = {};

@@ -155,31 +155,77 @@ function cachedMessages(channelId) {
   return [];
 }
 
+// snowflake compare without BigInt: longer string = bigger, else lexicographic
+function idGreater(a, b) {
+  if (!b) return true;
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return a.length > b.length;
+  return a > b;
+}
+
+function fetchRecent(channelId) {
+  var RestAPI = null;
+  try { RestAPI = metro.findByProps("getAPIBaseURL", "get"); } catch (e) {}
+  if (!RestAPI || typeof RestAPI.get !== "function") return Promise.resolve(null);
+  return RestAPI.get({ url: "/channels/" + channelId + "/messages", query: { limit: 50 } })
+    .then(function (res) { return (res && res.body) || null; })
+    .catch(function (e) { console.log(TAG, "fetch failed", e); return null; });
+}
+
+function newestPing(list, me, newestFirst) {
+  var order = newestFirst ? list : list.slice().reverse();
+  for (var i = 0; i < order.length; i++) {
+    var m = order[i];
+    if (!(m.author && m.author.id === me) && isWatchedPing(m, me)) return m.id;
+  }
+  return null;
+}
+
 function scanExisting() {
   var me = myId();
   var s = S();
   var CS = store("ChannelStore");
-  var count = 0;
+  var RS = store("ReadStateStore");
   var scanIds = mentionChannelIds();
-  scanIds.forEach(function (id) {
-    try {
-      var ch = CS && CS.getChannel && CS.getChannel(id);
-      if (!ch || !ch.guild_id) return; // servers only, never DMs
-      var msgs = cachedMessages(id);
-      var matchId = null, hit = false;
-      if (msgs.length) {
-        for (var i = msgs.length - 1; i >= 0; i--) {
-          var m = msgs[i];
-          if (!(m.author && m.author.id === me) && isWatchedPing(m, me)) { matchId = m.id; hit = true; break; }
-        }
+  var count = 0;
+
+  var jobs = scanIds.map(function (id) {
+    var ch;
+    try { ch = CS && CS.getChannel && CS.getChannel(id); } catch (e) {}
+    if (!ch || !ch.guild_id) return Promise.resolve(); // servers only, never DMs
+    var name = ch.name || id;
+
+    var finish = function (matchId) {
+      if (matchId) {
+        var acked = null;
+        try { acked = RS && RS.ackMessageId && RS.ackMessageId(id); } catch (e) {}
+        if (!idGreater(matchId, acked)) { dbg("skipped #" + name + " (ping already read)"); return; }
+        ackChannel(id, matchId, true);
+        count++;
+      } else if (s.clearUncached) {
+        ackChannel(id, null, false);
+        count++;
       } else {
-        hit = !!s.clearUncached;
+        dbg("skipped #" + name + " (no watched ping found)");
       }
-      if (hit) { ackChannel(id, matchId, !!matchId); count++; }
-    } catch (e) { console.log(TAG, "scan error", e); }
+    };
+
+    var cached = cachedMessages(id);
+    if (cached.length) {
+      var cm = newestPing(cached, me, false);
+      if (cm) { finish(cm); return Promise.resolve(); }
+    }
+    // not cached (or no ping among cached ones): look at the channel's recent messages
+    return fetchRecent(id).then(function (list) {
+      if (list && list.length) finish(newestPing(list, me, true));
+      else finish(null);
+    });
   });
-  dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
-  return count;
+
+  return Promise.all(jobs).then(function () {
+    dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
+    return count;
+  });
 }
 
 var pending = {};
@@ -189,6 +235,27 @@ function dbg(text) {
     if (S().debug) toasts.showToast("ARP: " + text, assets.getAssetIDByName("ic_check"));
     console.log(TAG, text);
   } catch (e) {}
+}
+
+// After acking, check the mention count really dropped; if not, retry with other methods.
+function verifyAck(channelId, entry, attempt) {
+  setTimeout(function () {
+    try {
+      var RS = store("ReadStateStore");
+      var left = RS && RS.getMentionCount ? RS.getMentionCount(channelId) : 0;
+      if (!left) { if (attempt > 0) dbg("cleared after retry " + attempt); return; }
+      if (attempt >= 2) { dbg("FAILED: still " + left + " mention(s) after retries"); return; }
+      dbg("still " + left + " mention(s), retry " + (attempt + 1));
+      if (attempt === 0) {
+        FluxDispatcher.dispatch({ type: "BULK_ACK", context: "APP", channels: entry });
+      } else {
+        var acker = null;
+        try { acker = metro.findByProps("bulkAck", "ack"); } catch (e) {}
+        if (acker && typeof acker.bulkAck === "function") acker.bulkAck(entry);
+      }
+      verifyAck(channelId, entry, attempt + 1);
+    } catch (e) { console.log(TAG, "verify error", e); }
+  }, 1200);
 }
 
 // exactId=true: mark read only up to fallbackMsgId (the ping), so later messages such as
@@ -212,6 +279,7 @@ function ackChannel(channelId, fallbackMsgId, exactId) {
     FluxDispatcher.dispatch({ type: "BULK_ACK", context: "APP", channels: entry });
     dbg("acked via dispatch (local only)");
   }
+  verifyAck(channelId, entry, 0);
 }
 
 function onMessage(action) {
@@ -339,8 +407,9 @@ function Settings() {
     h(Forms.FormRow, {
       label: "Clear existing pings now",
       onPress: function () {
-        var n = scanExisting();
-        toast(n ? "Cleared " + n + " channel" + (n === 1 ? "" : "s") : "Nothing to clear");
+        scanExisting().then(function (n) {
+          toast(n ? "Cleared " + n + " channel" + (n === 1 ? "" : "s") : "Nothing to clear");
+        });
       }
     })
   ));
@@ -441,4 +510,4 @@ var plug = {
 module.exports = { default: plug, __esModule: true };
 return module.exports;
 })();
-                                              
+                      

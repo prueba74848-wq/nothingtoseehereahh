@@ -34,7 +34,7 @@ var DEFAULTS = {
   roles: [],
   delay: 500,
   scanOnLoad: true,
-  clearUnknown: true,
+  clearUncached: false,
   debug: true
 };
 
@@ -166,15 +166,16 @@ function scanExisting() {
       var ch = CS && CS.getChannel && CS.getChannel(id);
       if (!ch || !ch.guild_id) return; // servers only, never DMs
       var msgs = cachedMessages(id);
-      var hit;
+      var matchId = null, hit = false;
       if (msgs.length) {
-        hit = msgs.some(function (m) {
-          return !(m.author && m.author.id === me) && isWatchedPing(m, me);
-        });
+        for (var i = msgs.length - 1; i >= 0; i--) {
+          var m = msgs[i];
+          if (!(m.author && m.author.id === me) && isWatchedPing(m, me)) { matchId = m.id; hit = true; break; }
+        }
       } else {
-        hit = !!s.clearUnknown;
+        hit = !!s.clearUncached;
       }
-      if (hit) { ackChannel(id, null); count++; }
+      if (hit) { ackChannel(id, matchId, !!matchId); count++; }
     } catch (e) { console.log(TAG, "scan error", e); }
   });
   dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
@@ -190,9 +191,11 @@ function dbg(text) {
   } catch (e) {}
 }
 
-function ackChannel(channelId, fallbackMsgId) {
+// exactId=true: mark read only up to fallbackMsgId (the ping), so later messages such as
+// direct mentions stay unread. Otherwise mark up to the channel's latest message.
+function ackChannel(channelId, fallbackMsgId, exactId) {
   var RS = store("ReadStateStore");
-  var messageId = (RS && RS.lastMessageId && RS.lastMessageId(channelId)) || fallbackMsgId;
+  var messageId = exactId ? fallbackMsgId : ((RS && RS.lastMessageId && RS.lastMessageId(channelId)) || fallbackMsgId);
   if (!messageId) {
     var ch = store("ChannelStore")?.getChannel?.(channelId);
     messageId = ch && ch.lastMessageId;
@@ -237,7 +240,7 @@ function onMessage(action) {
     var delay = Math.max(0, Number(S().delay) || 0);
     pending[channelId] = setTimeout(function () {
       delete pending[channelId];
-      try { ackChannel(channelId, msg.id); } catch (e) { console.log(TAG, "ack failed", e); }
+      try { ackChannel(channelId, msg.id, true); } catch (e) { console.log(TAG, "ack failed", e); }
     }, delay);
   } catch (e) {
     console.log(TAG, "handler error", e);
@@ -329,9 +332,9 @@ function Settings() {
     }),
     h(Forms.FormSwitchRow, {
       label: "Also clear channels I can't inspect",
-      subLabel: "Old pings whose messages aren't loaded can't be checked, so clear them anyway",
-      value: !!s.clearUnknown,
-      onValueChange: function (v) { s.clearUnknown = v; rerender(); }
+      subLabel: "Can't check what the ping was, so this may also clear direct @you mentions. Off is safer",
+      value: !!s.clearUncached,
+      onValueChange: function (v) { s.clearUncached = v; rerender(); }
     }),
     h(Forms.FormRow, {
       label: "Clear existing pings now",
@@ -438,3 +441,4 @@ var plug = {
 module.exports = { default: plug, __esModule: true };
 return module.exports;
 })();
+                                              

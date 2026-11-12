@@ -1,0 +1,15 @@
+{
+    "name": "Auto Read Pings",
+    "description": "Automatically marks the channel as read when you get pinged by @everyone, @here or roles you choose (build 9)",
+    "authors": [
+        {
+            "name": "you",
+            "id": "0"
+        }
+    ],
+    "main": "index.js",
+    "vendetta": {
+        "icon": "ic_eye"
+    },
+    "hash": "4e7fa8861f2c16d5d86db8217795ad1efe67a36544babf4be6256a11c543cecc"
+}

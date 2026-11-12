@@ -86,7 +86,7 @@ function roleName(roleId) {
       if (roles && roles[roleId]) return roles[roleId].name + " (" + guilds[gid].name + ")";
     }
   } catch (e) {}
-  return "Unknown role";
+  return "Role (name not loaded)";
 }
 
 // ---------- ping detection ----------
@@ -114,7 +114,7 @@ function isWatchedPing(msg, me) {
 
   if (mentionRoles && s.roles.length) {
     for (var j = 0; j < mentionRoles.length; j++) {
-      if (s.roles.indexOf(mentionRoles[j]) !== -1) return true;
+      if (s.roles.indexOf(String(mentionRoles[j])) !== -1) return true;
     }
   }
   return false;
@@ -181,18 +181,26 @@ function newestPing(list, me, newestFirst) {
   return null;
 }
 
-function scanExisting() {
+var seenCounts = {};
+
+// onlyNew=true: only look at channels whose mention count changed since the last look
+function scanExisting(onlyNew) {
   var me = myId();
   var s = S();
   var CS = store("ChannelStore");
   var RS = store("ReadStateStore");
   var scanIds = mentionChannelIds();
   var count = 0;
+  Object.keys(seenCounts).forEach(function (k) { if (scanIds.indexOf(k) === -1) delete seenCounts[k]; });
 
   var jobs = scanIds.map(function (id) {
     var ch;
     try { ch = CS && CS.getChannel && CS.getChannel(id); } catch (e) {}
     if (!ch || !ch.guild_id) return Promise.resolve(); // servers only, never DMs
+    var cnt = 0;
+    try { cnt = RS && RS.getMentionCount ? RS.getMentionCount(id) : 0; } catch (e) {}
+    if (onlyNew && seenCounts[id] === cnt) return Promise.resolve();
+    seenCounts[id] = cnt;
     var name = ch.name || id;
 
     var finish = function (matchId) {
@@ -201,6 +209,7 @@ function scanExisting() {
         try { acked = RS && RS.ackMessageId && RS.ackMessageId(id); } catch (e) {}
         if (!idGreater(matchId, acked)) { dbg("skipped #" + name + " (ping already read)"); return; }
         ackChannel(id, matchId, true);
+        delete seenCounts[id];
         count++;
       } else if (s.clearUncached) {
         ackChannel(id, null, false);
@@ -223,7 +232,7 @@ function scanExisting() {
   });
 
   return Promise.all(jobs).then(function () {
-    dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
+    if (!onlyNew || count) dbg("scan: " + scanIds.length + " channels with mentions, cleared " + count);
     return count;
   });
 }
@@ -299,7 +308,8 @@ function onMessage(action) {
     var me = myId();
     if (msg.author && msg.author.id === me) return;
     if (!isWatchedPing(msg, me)) {
-      if (msg.mention_everyone || (msg.mention_roles && msg.mention_roles.length)) dbg("ping seen but not matched");
+      var mr = msg.mention_roles || [];
+      if (msg.mention_everyone || mr.length) dbg("ping seen but not matched" + (mr.length ? " (role ids: " + mr.join(", ") + ")" : ""));
       return;
     }
     dbg("ping detected, clearing soon");
@@ -339,7 +349,15 @@ function Settings() {
     if (!gid) return;
     try {
       var GuildStore = store("GuildStore");
-      if (!GuildStore.getGuild(gid)) { toast("Server not found", "ic_close_16px"); return; }
+      if (!GuildStore.getGuild(gid)) {
+        // not an ID: try matching a server name
+        var needle = gid.toLowerCase(), gs = GuildStore.getGuilds(), found = null;
+        for (var k in gs) {
+          if ((gs[k].name || "").toLowerCase().indexOf(needle) !== -1) { found = k; break; }
+        }
+        if (!found) { toast("Server not found", "ic_close_16px"); return; }
+        gid = found;
+      }
       var all = rolesOf(gid);
       var mine = myRoleIds(gid);
       var allList = Object.keys(all)
@@ -349,7 +367,7 @@ function Settings() {
       var list = mine
         .filter(function (id) { return id !== gid; })
         .map(function (id) { return { id: id, name: (all[id] && all[id].name) || ("Role " + id) }; });
-      var note = "Known roles: " + allList.length + ", yours detected: " + list.length + ".";
+      var note = "Server: " + (GuildStore.getGuild(gid).name || gid) + ". Known roles: " + allList.length + ", yours detected: " + list.length + ".";
       if (!list.length && allList.length) {
         list = allList;
         note += " Couldn't detect which roles you have, so showing every role in this server.";
@@ -429,9 +447,9 @@ function Settings() {
 
   var pickerChildren = [
     h(Forms.FormText, { key: "help", style: { paddingHorizontal: 12, paddingTop: 8 } },
-      "Enter a server ID to list the roles you have there, then tap to toggle."),
+      "Enter a server name (like HTOS) or ID to list the roles you have there, then tap to toggle."),
     h(Forms.FormInput, {
-      key: "gin", placeholder: "Server ID", value: guildInput, onChange: setGuildInput,
+      key: "gin", placeholder: "Server name or ID", value: guildInput, onChange: setGuildInput,
       onSubmitEditing: loadGuildRoles
     }),
     h(Forms.FormRow, { key: "load", label: "Load my roles", onPress: loadGuildRoles })
@@ -477,6 +495,13 @@ function Settings() {
 
 // ---------- lifecycle ----------
 var scanTimers = [];
+var rsTimer;
+// Large servers don't always send MESSAGE_CREATE for channels you aren't viewing, but the
+// read state still changes. So also watch the read state and check channels with new mentions.
+function onReadStateChange() {
+  if (rsTimer) clearTimeout(rsTimer);
+  rsTimer = setTimeout(function () { try { scanExisting(true); } catch (e) {} }, 1500);
+}
 function onAppState(action) {
   try {
     if (action && action.state === "active" && S().scanOnLoad) {
@@ -489,6 +514,7 @@ var plug = {
     S();
     FluxDispatcher.subscribe("MESSAGE_CREATE", onMessage);
     FluxDispatcher.subscribe("APP_STATE_UPDATE", onAppState);
+    try { store("ReadStateStore")?.addChangeListener?.(onReadStateChange); } catch (e) {}
     if (S().scanOnLoad) {
       // the read state may not be populated right at startup, so retry a few times
       [3000, 10000, 30000].forEach(function (ms) {
@@ -498,6 +524,9 @@ var plug = {
   },
   onUnload: function () {
     FluxDispatcher.unsubscribe("APP_STATE_UPDATE", onAppState);
+    try { store("ReadStateStore")?.removeChangeListener?.(onReadStateChange); } catch (e) {}
+    if (rsTimer) clearTimeout(rsTimer);
+    seenCounts = {};
     scanTimers.forEach(clearTimeout);
     scanTimers = [];
     FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessage);
@@ -510,4 +539,4 @@ var plug = {
 module.exports = { default: plug, __esModule: true };
 return module.exports;
 })();
-                      
+  

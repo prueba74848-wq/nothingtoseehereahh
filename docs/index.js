@@ -163,13 +163,23 @@ function idGreater(a, b) {
   return a > b;
 }
 
+var lastFetchErr = null;
 function fetchRecent(channelId) {
+  lastFetchErr = null;
   var RestAPI = null;
   try { RestAPI = metro.findByProps("getAPIBaseURL", "get"); } catch (e) {}
-  if (!RestAPI || typeof RestAPI.get !== "function") return Promise.resolve(null);
+  if (!RestAPI || typeof RestAPI.get !== "function") { lastFetchErr = "RestAPI not found"; return Promise.resolve(null); }
   return RestAPI.get({ url: "/channels/" + channelId + "/messages", query: { limit: 50 } })
-    .then(function (res) { return (res && res.body) || null; })
-    .catch(function (e) { console.log(TAG, "fetch failed", e); return null; });
+    .then(function (res) {
+      if (res && res.body) return res.body;
+      lastFetchErr = "empty response";
+      return null;
+    })
+    .catch(function (e) {
+      lastFetchErr = String((e && (e.message || e.status || (e.body && e.body.message))) || e);
+      console.log(TAG, "fetch failed", e);
+      return null;
+    });
 }
 
 function newestPing(list, me, newestFirst) {
@@ -325,6 +335,48 @@ function onMessage(action) {
   }
 }
 
+// ---------- diagnostic ----------
+function runDiagnostic() {
+  var lines = [];
+  var s = S();
+  var me = myId();
+  var RS = store("ReadStateStore"), CS = store("ChannelStore"), GS = store("GuildStore"), MS = store("MessageStore");
+  lines.push("me=" + me);
+  lines.push("settings: everyone=" + s.everyone + " here=" + s.here + " direct=" + s.direct + " roles=[" + s.roles.join(",") + "]");
+  lines.push("stores: ReadState=" + !!RS + " Channel=" + !!CS + " Guild=" + !!GS + " Message=" + !!MS);
+  lines.push("ReadState fns: mentionChannelIds=" + typeof (RS && RS.getMentionChannelIds) +
+    " mentionCount=" + typeof (RS && RS.getMentionCount) +
+    " ackMessageId=" + typeof (RS && RS.ackMessageId) +
+    " lastMessageId=" + typeof (RS && RS.lastMessageId));
+  var acker = null, rest = null;
+  try { acker = metro.findByProps("bulkAck", "ack"); } catch (e) {}
+  try { rest = metro.findByProps("getAPIBaseURL", "get"); } catch (e) {}
+  lines.push("bulkAck=" + typeof (acker && acker.bulkAck) + " RestAPI.get=" + typeof (rest && rest.get));
+  var ids = mentionChannelIds();
+  lines.push("channels with mentions: " + ids.length);
+
+  var jobs = ids.slice(0, 4).map(function (id) {
+    var ch = null;
+    try { ch = CS && CS.getChannel(id); } catch (e) {}
+    var head = "#" + (ch && ch.name) + " id=" + id + " guild=" + (ch && ch.guild_id) +
+      " mentions=" + (RS && RS.getMentionCount ? RS.getMentionCount(id) : "?") +
+      " ack=" + (RS && RS.ackMessageId ? RS.ackMessageId(id) : "?");
+    var cached = cachedMessages(id);
+    return fetchRecent(id).then(function (list) {
+      var out = [head, "  cached=" + cached.length + " fetched=" + (list ? list.length : "FAIL (" + lastFetchErr + ")")];
+      (list || []).filter(function (m) {
+        return m.mention_everyone || (m.mention_roles && m.mention_roles.length) ||
+          (me && (m.mentions || []).some(function (x) { return (x && x.id) === me; }));
+      }).slice(0, 4).forEach(function (m) {
+        out.push("  msg " + m.id + " everyone=" + m.mention_everyone + " roles=[" + (m.mention_roles || []).join(",") +
+          "] match=" + isWatchedPing(m, me) + " \"" + String(m.content || "").slice(0, 25) + "\"");
+      });
+      return out.join("\n");
+    });
+  });
+  return Promise.all(jobs).then(function (parts) { return lines.concat(parts).join("\n"); });
+}
+
 // ---------- settings UI ----------
 function Settings() {
   var s = S();
@@ -335,6 +387,7 @@ function Settings() {
   var _d = React.useState([]), guildRoles = _d[0], setGuildRoles = _d[1];
   var _e = React.useState(String(s.delay)), delayInput = _e[0], setDelayInput = _e[1];
   var _f = React.useState(""), diag = _f[0], setDiag = _f[1];
+  var _g = React.useState(""), diagText = _g[0], setDiagText = _g[1];
 
   var toast = function (t, icon) { toasts.showToast(t, assets.getAssetIDByName(icon || "ic_check")); };
 
@@ -473,70 +526,4 @@ function Settings() {
 
   rows.push(h(Forms.FormSection, { key: "debug", title: "Troubleshooting" },
     h(Forms.FormSwitchRow, {
-      label: "Debug toasts", subLabel: "Shows what the plugin is doing (ping seen, matched, acked)",
-      value: !!s.debug,
-      onValueChange: function (v) { s.debug = v; rerender(); }
-    })
-  ));
-
-  rows.push(h(Forms.FormSection, { key: "delay", title: "Delay before marking read (ms)" },
-    h(Forms.FormInput, {
-      placeholder: "500", value: delayInput, keyboardType: "number-pad",
-      onChange: function (v) {
-        setDelayInput(v);
-        var n = parseInt(v, 10);
-        s.delay = isNaN(n) ? 0 : Math.max(0, n);
-      }
-    })
-  ));
-
-  return h.apply(null, [RN.ScrollView, { contentContainerStyle: { paddingBottom: 80 } }].concat(rows));
-}
-
-// ---------- lifecycle ----------
-var scanTimers = [];
-var rsTimer;
-// Large servers don't always send MESSAGE_CREATE for channels you aren't viewing, but the
-// read state still changes. So also watch the read state and check channels with new mentions.
-function onReadStateChange() {
-  if (rsTimer) clearTimeout(rsTimer);
-  rsTimer = setTimeout(function () { try { scanExisting(true); } catch (e) {} }, 1500);
-}
-function onAppState(action) {
-  try {
-    if (action && action.state === "active" && S().scanOnLoad) {
-      scanTimers.push(setTimeout(function () { try { scanExisting(); } catch (e) {} }, 2000));
-    }
-  } catch (e) {}
-}
-var plug = {
-  onLoad: function () {
-    S();
-    FluxDispatcher.subscribe("MESSAGE_CREATE", onMessage);
-    FluxDispatcher.subscribe("APP_STATE_UPDATE", onAppState);
-    try { store("ReadStateStore")?.addChangeListener?.(onReadStateChange); } catch (e) {}
-    if (S().scanOnLoad) {
-      // the read state may not be populated right at startup, so retry a few times
-      [3000, 10000, 30000].forEach(function (ms) {
-        scanTimers.push(setTimeout(function () { try { scanExisting(); } catch (e) {} }, ms));
-      });
-    }
-  },
-  onUnload: function () {
-    FluxDispatcher.unsubscribe("APP_STATE_UPDATE", onAppState);
-    try { store("ReadStateStore")?.removeChangeListener?.(onReadStateChange); } catch (e) {}
-    if (rsTimer) clearTimeout(rsTimer);
-    seenCounts = {};
-    scanTimers.forEach(clearTimeout);
-    scanTimers = [];
-    FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessage);
-    for (var k in pending) clearTimeout(pending[k]);
-    pending = {};
-  },
-  settings: Settings
-};
-
-module.exports = { default: plug, __esModule: true };
-return module.exports;
-})();
-  
+      label: "Debug toasts", subLabel: "Shows what the plugin is doing (ping see

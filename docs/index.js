@@ -143,21 +143,30 @@ if (a.length !== b.length) return a.length > b.length;
 return a > b;
 }
 var lastFetchErr = null;
-function fetchRecent(channelId) {
+function fetchRecent(channelId, afterId) {
 lastFetchErr = null;
 var RestAPI = null;
 try { RestAPI = metro.findByProps("getAPIBaseURL", "get"); } catch (e) {}
 if (!RestAPI || typeof RestAPI.get !== "function") { lastFetchErr = "RestAPI not found"; return Promise.resolve(null); }
-return RestAPI.get({ url: "/channels/" + channelId + "/messages", query: { limit: 50 } })
-.then(function (res) {
-if (res && res.body) return res.body;
-lastFetchErr = "empty response";
-return null;
-})
-.catch(function (e) {
+var all = [];
+var step = function (after, n) {
+var q = { limit: after ? 100 : 50 };
+if (after) q.after = after;
+return RestAPI.get({ url: "/channels/" + channelId + "/messages", query: q }).then(function (res) {
+var b = res && res.body;
+if (!b) { lastFetchErr = "empty response"; return all.length ? all : null; }
+all = b.concat(all);
+if (after && b.length >= 100 && n < 5) {
+var newest = b[0].id;
+for (var k = 1; k < b.length; k++) if (idGreater(b[k].id, newest)) newest = b[k].id;
+return step(newest, n + 1);
+}
+return all;
+});
+};
+return step(afterId || null, 0).catch(function (e) {
 lastFetchErr = String((e && (e.message || e.status || (e.body && e.body.message))) || e);
-console.log(TAG, "fetch failed", e);
-return null;
+return all.length ? all : null;
 });
 }
 function newestPing(list, me, newestFirst) {
@@ -186,11 +195,13 @@ try { cnt = RS && RS.getMentionCount ? RS.getMentionCount(id) : 0; } catch (e) {
 if (onlyNew && seenCounts[id] === cnt) return Promise.resolve();
 seenCounts[id] = cnt;
 var name = ch.name || id;
+var ackPtr = null;
+try { ackPtr = RS && RS.ackMessageId ? RS.ackMessageId(id) : null; } catch (e) {}
 var finish = function (matchId) {
 if (matchId) {
 var acked = null;
 try { acked = RS && RS.ackMessageId && RS.ackMessageId(id); } catch (e) {}
-if (!idGreater(matchId, acked)) { dbg("skipped #" + name + " (ping already read)"); return; }
+if (!idGreater(matchId, acked)) { dbg("skip: already read"); return; }
 ackChannel(id, matchId, true);
 delete seenCounts[id];
 count++;
@@ -198,7 +209,7 @@ count++;
 ackChannel(id, null, false);
 count++;
 } else {
-dbg("skipped #" + name + " (no watched ping found)");
+dbg("skip #" + name + ": no ping");
 }
 };
 var cached = cachedMessages(id);
@@ -206,7 +217,7 @@ if (cached.length) {
 var cm = newestPing(cached, me, false);
 if (cm) { finish(cm); return Promise.resolve(); }
 }
-return fetchRecent(id).then(function (list) {
+return fetchRecent(id, ackPtr).then(function (list) {
 if (list && list.length) finish(newestPing(list, me, true));
 else finish(null);
 });
@@ -220,7 +231,6 @@ var pending = {};
 function dbg(text) {
 try {
 if (S().debug) toasts.showToast("ARP: " + text, assets.getAssetIDByName("ic_check"));
-console.log(TAG, text);
 } catch (e) {}
 }
 function verifyAck(channelId, entry, attempt) {
@@ -229,7 +239,7 @@ try {
 var RS = store("ReadStateStore");
 var left = RS && RS.getMentionCount ? RS.getMentionCount(channelId) : 0;
 if (!left) { if (attempt > 0) dbg("cleared after retry " + attempt); return; }
-if (attempt >= 2) { dbg("FAILED: still " + left + " mention(s) after retries"); return; }
+if (attempt >= 2) { dbg("FAILED: still " + left); return; }
 dbg("still " + left + " mention(s), retry " + (attempt + 1));
 if (attempt === 0) {
 FluxDispatcher.dispatch({ type: "BULK_ACK", context: "APP", channels: entry });
@@ -239,7 +249,7 @@ try { acker = metro.findByProps("bulkAck", "ack"); } catch (e) {}
 if (acker && typeof acker.bulkAck === "function") acker.bulkAck(entry);
 }
 verifyAck(channelId, entry, attempt + 1);
-} catch (e) { console.log(TAG, "verify error", e); }
+} catch (e) { }
 }, 1200);
 }
 function ackChannel(channelId, fallbackMsgId, exactId) {
@@ -286,10 +296,9 @@ if (pending[channelId]) clearTimeout(pending[channelId]);
 var delay = Math.max(0, Number(S().delay) || 0);
 pending[channelId] = setTimeout(function () {
 delete pending[channelId];
-try { ackChannel(channelId, msg.id, true); } catch (e) { console.log(TAG, "ack failed", e); }
+try { ackChannel(channelId, msg.id, true); } catch (e) { }
 }, delay);
 } catch (e) {
-console.log(TAG, "handler error", e);
 }
 }
 function runDiagnostic() {
@@ -317,8 +326,10 @@ var head = "#" + (ch && ch.name) + " id=" + id + " guild=" + (ch && ch.guild_id)
 " mentions=" + (RS && RS.getMentionCount ? RS.getMentionCount(id) : "?") +
 " ack=" + (RS && RS.ackMessageId ? RS.ackMessageId(id) : "?");
 var cached = cachedMessages(id);
-return fetchRecent(id).then(function (list) {
-var out = [head, "  cached=" + cached.length + " fetched=" + (list ? list.length : "FAIL (" + lastFetchErr + ")")];
+var ackPtrD = null;
+try { ackPtrD = RS && RS.ackMessageId ? RS.ackMessageId(id) : null; } catch (e) {}
+return fetchRecent(id, ackPtrD).then(function (list) {
+var out = [head, "  cached=" + cached.length + " fetched(after ack)=" + (list ? list.length : "FAIL (" + lastFetchErr + ")")];
 (list || []).filter(function (m) {
 return m.mention_everyone || (m.mention_roles && m.mention_roles.length) ||
 (me && (m.mentions || []).some(function (x) { return (x && x.id) === me; }));
@@ -372,7 +383,7 @@ var list = mine
 var note = "Server: " + (GuildStore.getGuild(gid).name || gid) + ". Known roles: " + allList.length + ", yours detected: " + list.length + ".";
 if (!list.length && allList.length) {
 list = allList;
-note += " Couldn't detect which roles you have, so showing every role in this server.";
+note += " Showing all roles.";
 toast("Showing all server roles", "ic_check");
 } else if (!list.length) {
 toast("No roles found for that server", "ic_close_16px");
@@ -380,7 +391,6 @@ toast("No roles found for that server", "ic_close_16px");
 setDiag(note);
 setGuildRoles(list);
 } catch (e) {
-console.log(TAG, "load roles failed", e);
 toast("Couldn't load roles", "ic_close_16px");
 }
 };
@@ -416,7 +426,7 @@ onValueChange: function (v) { s.scanOnLoad = v; rerender(); }
 }),
 h(Forms.FormSwitchRow, {
 label: "Also clear channels I can't inspect",
-subLabel: "Can't check what the ping was, so this may also clear direct @you mentions. Off is safer",
+subLabel: "May also clear direct @you mentions. Off is safer",
 value: !!s.clearUncached,
 onValueChange: function (v) { s.clearUncached = v; rerender(); }
 }),
@@ -442,7 +452,7 @@ onPress: function () { toggleRole(id); }
 rows.push(h.apply(null, [Forms.FormSection, { key: "selroles", title: "Auto-read these roles" }].concat(selectedRows)));
 var pickerChildren = [
 h(Forms.FormText, { key: "help", style: { paddingHorizontal: 12, paddingTop: 8 } },
-"Enter a server name (like HTOS) or ID to list the roles you have there, then tap to toggle."),
+"Server name or ID, then tap roles to toggle."),
 h(Forms.FormInput, {
 key: "gin", placeholder: "Server name or ID", value: guildInput, onChange: setGuildInput,
 onSubmitEditing: loadGuildRoles
@@ -518,7 +528,6 @@ scanTimers.push(setTimeout(function () { try { scanExisting(); } catch (e) {} },
 });
 }
 } catch (e) {
-console.log(TAG, "load error", e);
 try { toasts.showToast("ARP load error: " + ((e && e.message) || e), assets.getAssetIDByName("ic_close_16px")); } catch (e2) {}
 }
 },

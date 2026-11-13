@@ -149,22 +149,22 @@ var RestAPI = null;
 try { RestAPI = metro.findByProps("getAPIBaseURL", "get"); } catch (e) {}
 if (!RestAPI || typeof RestAPI.get !== "function") { lastFetchErr = "RestAPI not found"; return Promise.resolve(null); }
 var all = [];
-var step = function (after, n) {
-var q = { limit: after ? 100 : 50 };
-if (after) q.after = after;
+var step = function (before, n) {
+var q = { limit: 100 };
+if (before) q.before = before;
 return RestAPI.get({ url: "/channels/" + channelId + "/messages", query: q }).then(function (res) {
 var b = res && res.body;
 if (!b) { lastFetchErr = "empty response"; return all.length ? all : null; }
-all = b.concat(all);
-if (after && b.length >= 100 && n < 5) {
-var newest = b[0].id;
-for (var k = 1; k < b.length; k++) if (idGreater(b[k].id, newest)) newest = b[k].id;
-return step(newest, n + 1);
+all = all.concat(b);
+if (afterId && b.length >= 100 && n < 9) {
+var oldest = b[0].id;
+for (var k = 1; k < b.length; k++) if (idGreater(oldest, b[k].id)) oldest = b[k].id;
+if (idGreater(oldest, afterId)) return step(oldest, n + 1);
 }
 return all;
 });
 };
-return step(afterId || null, 0).catch(function (e) {
+return step(null, 0).catch(function (e) {
 lastFetchErr = String((e && (e.message || e.status || (e.body && e.body.message))) || e);
 return all.length ? all : null;
 });
@@ -329,7 +329,7 @@ var cached = cachedMessages(id);
 var ackPtrD = null;
 try { ackPtrD = RS && RS.ackMessageId ? RS.ackMessageId(id) : null; } catch (e) {}
 return fetchRecent(id, ackPtrD).then(function (list) {
-var out = [head, "  cached=" + cached.length + " fetched(after ack)=" + (list ? list.length : "FAIL (" + lastFetchErr + ")")];
+var out = [head, "  cached=" + cached.length + " fetched=" + (list ? list.length : "FAIL (" + lastFetchErr + ")")];
 (list || []).filter(function (m) {
 return m.mention_everyone || (m.mention_roles && m.mention_roles.length) ||
 (me && (m.mentions || []).some(function (x) { return (x && x.id) === me; }));
